@@ -12,8 +12,8 @@ go:
 go_import_path: github.com/go-ble/ble
 
 install:
-        - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; go get ./...; fi
-        - if [[ "$TRAVIS_OS_NAME" == "linux" ]]; go get && go get ./linux; fi
+        - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then go get ./...; fi
+        - if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then go get && go get ./linux; fi
 
 
 script:
