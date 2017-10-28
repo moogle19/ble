@@ -46,7 +46,7 @@ func NewDeviceWithNameAndHandler(name string, handler ble.NotifyHandler) (*Devic
 	return &Device{HCI: dev, Server: srv}, nil
 }
 
-func loop(dev *hci.HCI, s *gatt.Server, mtu int) {
+func loop(dev ble.Listener, s *gatt.Server, mtu int) {
 	for {
 		l2c, err := dev.Accept()
 		if err != nil {
@@ -72,7 +72,7 @@ func loop(dev *hci.HCI, s *gatt.Server, mtu int) {
 
 // Device ...
 type Device struct {
-	HCI    *hci.HCI
+	HCI    ble.Listener
 	Server *gatt.Server
 }
 
