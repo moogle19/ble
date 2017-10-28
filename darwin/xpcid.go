@@ -57,9 +57,12 @@ var (
 
 var serviceID string
 
-func initXpcIDs() {
+func initXpcIDs() error {
 	var utsname xpc.Utsname
-	xpc.Uname(&utsname)
+	err := xpc.Uname(&utsname)
+	if err != nil {
+		return err
+	}
 
 	cmdInit = 1
 	cmdAdvertiseStart = 8
@@ -162,4 +165,6 @@ func initXpcIDs() {
 
 		serviceID = "com.apple.bluetoothd"
 	}
+
+	return nil
 }
