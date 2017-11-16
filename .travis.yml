@@ -17,7 +17,8 @@ install:
 
 
 script:
-        - go vet ./...
+        - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then go vet ./...; fi
+        - if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then GOOS=linux go vet && GOOS=linux go vet ./linux/...; fi
         - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then go test ./...; fi
         - if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then GOOS=linux go test && GOOS=linux go test ./linux/...; fi
         - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then go build -v ./...; fi
