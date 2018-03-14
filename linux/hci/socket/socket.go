@@ -144,3 +144,29 @@ func (s *Socket) Close() error {
 	defer s.rmu.Unlock()
 	return errors.Wrap(unix.Close(s.fd), "can't close hci socket")
 }
+
+//Up turn up a HCI device by ID
+func Up(id int) error {
+	// Create RAW HCI Socket.
+	fd, err := unix.Socket(unix.AF_BLUETOOTH, unix.SOCK_RAW, unix.BTPROTO_HCI)
+	if err != nil {
+		return errors.Wrap(err, "can't create socket")
+	}
+	if err := ioctl(uintptr(fd), hciUpDevice, uintptr(id)); err != nil {
+		return errors.Wrap(err, "can't down device")
+	}
+	return unix.Close(fd)
+}
+
+//Down turn down a HCI device by ID
+func Down(id int) error {
+	// Create RAW HCI Socket.
+	fd, err := unix.Socket(unix.AF_BLUETOOTH, unix.SOCK_RAW, unix.BTPROTO_HCI)
+	if err != nil {
+		return errors.Wrap(err, "can't create socket")
+	}
+	if err := ioctl(uintptr(fd), hciDownDevice, uintptr(id)); err != nil {
+		return errors.Wrap(err, "can't down device")
+	}
+	return unix.Close(fd)
+}
