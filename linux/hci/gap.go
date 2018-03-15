@@ -206,11 +206,10 @@ func (h *HCI) Dial(ctx context.Context, a ble.Addr) (ble.Client, error) {
 		return nil, err
 	}
 	var tmo <-chan time.Time
-	if deadline, ok := ctx.Deadline(); ok {
-		tmo = time.After(time.Until(deadline))
-	} else if h.dialerTmo != time.Duration(0) {
+	if h.dialerTmo != time.Duration(0) {
 		tmo = time.After(h.dialerTmo)
 	}
+
 	select {
 	case <-ctx.Done():
 		return h.cancelDial()
