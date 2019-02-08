@@ -170,3 +170,27 @@ func Down(id int) error {
 	}
 	return unix.Close(fd)
 }
+
+//List List HCI devices
+func List() ([]int, error) {
+
+	var err error
+
+	// Create RAW HCI Socket.
+	fd, err := unix.Socket(unix.AF_BLUETOOTH, unix.SOCK_RAW, unix.BTPROTO_HCI)
+	if err != nil {
+		return nil, errors.Wrap(err, "can't create socket")
+	}
+
+	req := devListRequest{devNum: hciMaxDevices}
+	if err = ioctl(uintptr(fd), hciGetDeviceList, uintptr(unsafe.Pointer(&req))); err != nil {
+		return nil, errors.Wrap(err, "can't get device list")
+	}
+
+	list := make([]int, 0)
+	for id := 0; id < int(req.devNum); id++ {
+		list = append(list, id)
+	}
+
+	return list, nil
+}
