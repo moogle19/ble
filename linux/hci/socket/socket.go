@@ -119,14 +119,21 @@ func open(fd, id int) (*Socket, error) {
 }
 
 func (s *Socket) Read(p []byte) (int, error) {
+	s.rmu.Lock()
+	n, err := unix.Read(s.fd, p)
+	s.rmu.Unlock()
+	// Close always sends a dummy command to wake up Read
+	// bad things happen to the HCI state machines if they receive
+	// a reply from that command, so make sure no data is returned
+	// on a closed socket.
+	//
+	// note that if Write and Close are called concurrently it's
+	// indeterminate which replies get through.
 	select {
 	case <-s.closed:
 		return 0, io.EOF
 	default:
 	}
-	s.rmu.Lock()
-	defer s.rmu.Unlock()
-	n, err := unix.Read(s.fd, p)
 	return n, errors.Wrap(err, "can't read hci socket")
 }
 
@@ -139,8 +146,58 @@ func (s *Socket) Write(p []byte) (int, error) {
 
 func (s *Socket) Close() error {
 	close(s.closed)
-	s.Write([]byte{0x01, 0x09, 0x10, 0x00})
+	s.Write([]byte{0x01, 0x09, 0x10, 0x00}) // no-op command to wake up the Read call if it's blocked
 	s.rmu.Lock()
 	defer s.rmu.Unlock()
 	return errors.Wrap(unix.Close(s.fd), "can't close hci socket")
+}
+
+//Up turn up a HCI device by ID
+func Up(id int) error {
+	// Create RAW HCI Socket.
+	fd, err := unix.Socket(unix.AF_BLUETOOTH, unix.SOCK_RAW, unix.BTPROTO_HCI)
+	if err != nil {
+		return errors.Wrap(err, "can't create socket")
+	}
+	if err := ioctl(uintptr(fd), hciUpDevice, uintptr(id)); err != nil {
+		return errors.Wrap(err, "can't down device")
+	}
+	return unix.Close(fd)
+}
+
+//Down turn down a HCI device by ID
+func Down(id int) error {
+	// Create RAW HCI Socket.
+	fd, err := unix.Socket(unix.AF_BLUETOOTH, unix.SOCK_RAW, unix.BTPROTO_HCI)
+	if err != nil {
+		return errors.Wrap(err, "can't create socket")
+	}
+	if err := ioctl(uintptr(fd), hciDownDevice, uintptr(id)); err != nil {
+		return errors.Wrap(err, "can't down device")
+	}
+	return unix.Close(fd)
+}
+
+//List List HCI devices
+func List() ([]int, error) {
+
+	var err error
+
+	// Create RAW HCI Socket.
+	fd, err := unix.Socket(unix.AF_BLUETOOTH, unix.SOCK_RAW, unix.BTPROTO_HCI)
+	if err != nil {
+		return nil, errors.Wrap(err, "can't create socket")
+	}
+
+	req := devListRequest{devNum: hciMaxDevices}
+	if err = ioctl(uintptr(fd), hciGetDeviceList, uintptr(unsafe.Pointer(&req))); err != nil {
+		return nil, errors.Wrap(err, "can't get device list")
+	}
+
+	list := make([]int, 0)
+	for id := 0; id < int(req.devNum); id++ {
+		list = append(list, id)
+	}
+
+	return list, nil
 }
