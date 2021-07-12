@@ -3,6 +3,7 @@ package hci
 import (
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -35,13 +36,14 @@ type pkt struct {
 }
 
 // NewHCI returns a hci device.
-func NewHCI(opts ...Option) (*HCI, error) {
+func NewHCI(opts ...ble.Option) (*HCI, error) {
 	h := &HCI{
 		id: -1,
 
 		chCmdPkt:  make(chan *pkt),
 		chCmdBufs: make(chan []byte, 16),
 		sent:      make(map[int]*pkt),
+		muSent:    &sync.Mutex{},
 
 		evth: map[int]handlerFn{},
 		subh: map[int]handlerFn{},
@@ -73,6 +75,7 @@ type HCI struct {
 	// Host to Controller command flow control [Vol 2, Part E, 4.4]
 	chCmdPkt  chan *pkt
 	chCmdBufs chan []byte
+	muSent    *sync.Mutex
 	sent      map[int]*pkt
 
 	// evtHub
@@ -108,6 +111,9 @@ type HCI struct {
 	chMasterConn chan *Conn // Dial returns master connections.
 	chSlaveConn  chan *Conn // Peripheral accept slave connections.
 
+	connectedHandler    func(evt.LEConnectionComplete)
+	disconnectedHandler func(evt.DisconnectionComplete)
+
 	dialerTmo   time.Duration
 	listenerTmo time.Duration
 
@@ -142,7 +148,7 @@ func (h *HCI) Init() error {
 	}
 	h.skt = skt
 
-	h.chCmdBufs <- make([]byte, 64)
+	h.setAllowedCommands(1)
 
 	go h.sktLoop()
 	if err := h.init(); err != nil {
@@ -169,7 +175,7 @@ func (h *HCI) Error() error {
 }
 
 // Option sets the options specified.
-func (h *HCI) Option(opts ...Option) error {
+func (h *HCI) Option(opts ...ble.Option) error {
 	var err error
 	for _, opt := range opts {
 		err = opt(h)
@@ -248,19 +254,43 @@ func (h *HCI) send(c Command) ([]byte, error) {
 		h.close(fmt.Errorf("hci: failed to marshal cmd"))
 	}
 
-	h.sent[c.OpCode()] = p // TODO: lock
+	h.muSent.Lock()
+	h.sent[c.OpCode()] = p
+	h.muSent.Unlock()
 	if n, err := h.skt.Write(b[:4+c.Len()]); err != nil {
 		h.close(fmt.Errorf("hci: failed to send cmd"))
 	} else if n != 4+c.Len() {
 		h.close(fmt.Errorf("hci: failed to send whole cmd pkt to hci socket"))
 	}
 
+	var ret []byte
+	var err error
+
+	// emergency timeout to prevent calls from locking up if the HCI
+	// interface doesn't respond.  Responsed here should normally be fast
+	// a timeout indicates a major problem with HCI.
+	timeout := time.NewTimer(10 * time.Second)
 	select {
+	case <-timeout.C:
+		err = fmt.Errorf("hci: no response to command, hci connection failed")
+		ret = nil
 	case <-h.done:
-		return nil, h.err
+		err = h.err
+		ret = nil
 	case b := <-p.done:
-		return b, nil
+		err = nil
+		ret = b
 	}
+	timeout.Stop()
+
+	// clear sent table when done, we sometimes get command complete or
+	// command status messages with no matching send, which can attempt to
+	// access stale packets in sent and fail or lock up.
+	h.muSent.Lock()
+	delete(h.sent, c.OpCode())
+	h.muSent.Unlock()
+
+	return ret, err
 }
 
 func (h *HCI) sktLoop() {
@@ -269,7 +299,11 @@ func (h *HCI) sktLoop() {
 	for {
 		n, err := h.skt.Read(b)
 		if n == 0 || err != nil {
-			h.err = fmt.Errorf("skt: %s", err)
+			if err == io.EOF {
+				h.err = err //callers depend on detecting io.EOF, don't wrap it.
+			} else {
+				h.err = fmt.Errorf("skt: %s", err)
+			}
 			return
 		}
 		p := make([]byte, n)
@@ -278,10 +312,10 @@ func (h *HCI) sktLoop() {
 			// Some bluetooth devices may append vendor specific packets at the last,
 			// in this case, simply ignore them.
 			if strings.HasPrefix(err.Error(), "unsupported vendor packet:") {
-				logger.Error("skt: %v", err)
+				_ = logger.Error("skt: %v", err)
 			} else {
-				h.err = fmt.Errorf("skt: %v", err)
-				return
+				log.Printf("skt: %v", err)
+				continue
 			}
 		}
 	}
@@ -289,7 +323,10 @@ func (h *HCI) sktLoop() {
 
 func (h *HCI) close(err error) error {
 	h.err = err
-	return h.skt.Close()
+	if h.skt != nil {
+		return h.skt.Close()
+	}
+	return err
 }
 
 func (h *HCI) handlePkt(b []byte) error {
@@ -317,7 +354,7 @@ func (h *HCI) handleACL(b []byte) error {
 	c, ok := h.conns[handle]
 	h.muConns.Unlock()
 	if !ok {
-		logger.Warn("invalid connection handle on ACL packet", "handle", handle)
+		_ = logger.Warn("invalid connection handle on ACL packet", "handle", handle)
 		return nil
 	}
 	c.chInPkt <- b
@@ -403,16 +440,16 @@ func (h *HCI) handleLEAdvertisingReport(b []byte) error {
 
 func (h *HCI) handleCommandComplete(b []byte) error {
 	e := evt.CommandComplete(b)
-	for i := 0; i < int(e.NumHCICommandPackets()); i++ {
-		h.chCmdBufs <- make([]byte, 64)
-	}
+	h.setAllowedCommands(int(e.NumHCICommandPackets()))
 
 	// NOP command, used for flow control purpose [Vol 2, Part E, 4.4]
+	// no handling other than setAllowedCommands needed
 	if e.CommandOpcode() == 0x0000 {
-		h.chCmdBufs = make(chan []byte, 16)
 		return nil
 	}
+	h.muSent.Lock()
 	p, found := h.sent[int(e.CommandOpcode())]
+	h.muSent.Unlock()
 	if !found {
 		return fmt.Errorf("can't find the cmd for CommandCompleteEP: % X", e)
 	}
@@ -422,11 +459,11 @@ func (h *HCI) handleCommandComplete(b []byte) error {
 
 func (h *HCI) handleCommandStatus(b []byte) error {
 	e := evt.CommandStatus(b)
-	for i := 0; i < int(e.NumHCICommandPackets()); i++ {
-		h.chCmdBufs <- make([]byte, 64)
-	}
+	h.setAllowedCommands(int(e.NumHCICommandPackets()))
 
+	h.muSent.Lock()
 	p, found := h.sent[int(e.CommandOpcode())]
+	h.muSent.Unlock()
 	if !found {
 		return fmt.Errorf("can't find the cmd for CommandStatusEP: % X", e)
 	}
@@ -436,6 +473,10 @@ func (h *HCI) handleCommandStatus(b []byte) error {
 
 func (h *HCI) handleLEConnectionComplete(b []byte) error {
 	e := evt.LEConnectionComplete(b)
+	if e.Role() == roleMaster && ErrCommand(e.Status()) == ErrConnID {
+		// The connection was canceled successfully.
+		return nil
+	}
 	c := newConn(h, e)
 	h.muConns.Lock()
 	h.conns[e.ConnectionHandle()] = c
@@ -447,10 +488,6 @@ func (h *HCI) handleLEConnectionComplete(b []byte) error {
 			default:
 				go c.Close()
 			}
-			return nil
-		}
-		if ErrCommand(e.Status()) == ErrConnID {
-			// The connection was canceled successfully.
 			return nil
 		}
 		return nil
@@ -468,9 +505,12 @@ func (h *HCI) handleLEConnectionComplete(b []byte) error {
 		// So we also re-enable the advertising when a connection disconnected
 		h.params.RLock()
 		if h.params.advEnable.AdvertisingEnable == 1 {
-			go h.Send(&h.params.advEnable, nil)
+			go h.Send(&cmd.LESetAdvertiseEnable{AdvertisingEnable: 0}, nil)
 		}
 		h.params.RUnlock()
+	}
+	if h.connectedHandler != nil {
+		h.connectedHandler(e)
 	}
 	return nil
 }
@@ -490,7 +530,7 @@ func (h *HCI) handleDisconnectionComplete(b []byte) error {
 	}
 	close(c.chInPkt)
 
-	if c.param.Role() == roleMaster {
+	if c.param.Role() == roleSlave {
 		// Re-enable advertising, if it was advertising. Refer to the
 		// handleLEConnectionComplete() for details.
 		// This may failed with ErrCommandDisallowed, if the controller
@@ -506,7 +546,16 @@ func (h *HCI) handleDisconnectionComplete(b []byte) error {
 	}
 	// When a connection disconnects, all the sent packets and weren't acked yet
 	// will be recycled. [Vol2, Part E 4.1.1]
+	//
+	// must be done with the pool locked to avoid race conditions where
+	// writePDU is in progress and does a Get from the pool after this completes,
+	// leaking a buffer from the main pool.
+	c.txBuffer.LockPool()
 	c.txBuffer.PutAll()
+	c.txBuffer.UnlockPool()
+	if h.disconnectedHandler != nil {
+		h.disconnectedHandler(e)
+	}
 	return nil
 }
 
@@ -533,4 +582,18 @@ func (h *HCI) handleLELongTermKeyRequest(b []byte) error {
 	return h.Send(&cmd.LELongTermKeyRequestNegativeReply{
 		ConnectionHandle: e.ConnectionHandle(),
 	}, nil)
+}
+
+func (h *HCI) setAllowedCommands(n int) {
+
+	//hard-coded limit to command queue depth
+	//matches make(chan []byte, 16) in NewHCI
+	// TODO make this a constant, decide correct size
+	if n > 16 {
+		n = 16
+	}
+
+	for len(h.chCmdBufs) < n {
+		h.chCmdBufs <- make([]byte, 64) // TODO make buffer size a constant
+	}
 }

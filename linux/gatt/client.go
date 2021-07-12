@@ -208,7 +208,13 @@ func (p *Client) DiscoverDescriptors(filter []ble.UUID, c *ble.Characteristic) (
 func (p *Client) ReadCharacteristic(c *ble.Characteristic) ([]byte, error) {
 	p.Lock()
 	defer p.Unlock()
-	return p.ac.Read(c.ValueHandle)
+	val, err := p.ac.Read(c.ValueHandle)
+	if err != nil {
+		return nil, err
+	}
+
+	c.Value = val
+	return val, nil
 }
 
 // ReadLongCharacteristic reads a characteristic value which is longer than the MTU. [Vol 3, Part G, 4.8.3]
@@ -231,6 +237,8 @@ func (p *Client) ReadLongCharacteristic(c *ble.Characteristic) ([]byte, error) {
 		}
 		buffer = append(buffer, read...)
 	}
+
+	c.Value = buffer
 	return buffer, nil
 }
 
@@ -244,11 +252,37 @@ func (p *Client) WriteCharacteristic(c *ble.Characteristic, v []byte, noRsp bool
 	return p.ac.Write(c.ValueHandle, v)
 }
 
+// WriteLongCharacteristic writes a characteristic value that is longer than the MTU to a server. [Vol 3, Part F, 3.4.6]
+func (p *Client) WriteLongCharacteristic(c *ble.Characteristic, v []byte) error {
+	p.Lock()
+	defer p.Unlock()
+
+	offset := 0
+	prepareWriteLength := 0
+
+	for offset < len(v) {
+		prepareWriteLength = MinInt( len(v) - offset, p.conn.TxMTU()-5 )
+		value := v[offset:offset+prepareWriteLength]
+		if _, _, _, err := p.ac.PrepareWrite(c.ValueHandle, uint16(offset), value ); err != nil {
+			return err
+		}
+		offset += prepareWriteLength
+	}
+
+	return p.ac.ExecuteWrite(0x01) // flags: 0x00=cancel all, 0x01=write all
+}
+
 // ReadDescriptor reads a characteristic descriptor from a server. [Vol 3, Part G, 4.12.1]
 func (p *Client) ReadDescriptor(d *ble.Descriptor) ([]byte, error) {
 	p.Lock()
 	defer p.Unlock()
-	return p.ac.Read(d.Handle)
+	val, err := p.ac.Read(d.Handle)
+	if err != nil {
+		return nil, err
+	}
+
+	d.Value = val
+	return val, nil
 }
 
 // WriteDescriptor writes a characteristic descriptor to a server. [Vol 3, Part G, 4.12.3]
@@ -262,8 +296,7 @@ func (p *Client) WriteDescriptor(d *ble.Descriptor, v []byte) error {
 func (p *Client) ReadRSSI() int {
 	p.Lock()
 	defer p.Unlock()
-	// TODO:
-	return 0
+	return p.conn.ReadRSSI()
 }
 
 // ExchangeMTU informs the server of the client’s maximum receive MTU size and
@@ -357,6 +390,11 @@ func (p *Client) Disconnected() <-chan struct{} {
 	return p.conn.Disconnected()
 }
 
+// Conn returns the client's current connection.
+func (p *Client) Conn() ble.Conn {
+	return p.conn
+}
+
 // HandleNotification ...
 func (p *Client) HandleNotification(req []byte) {
 	p.Lock()
@@ -382,4 +420,11 @@ type sub struct {
 	ccc      uint16
 	nHandler ble.NotificationHandler
 	iHandler ble.NotificationHandler
+}
+
+func MinInt( a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

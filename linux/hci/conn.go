@@ -33,9 +33,6 @@ type Conn struct {
 	txMTU int
 	rxMPS int
 
-	// leFrame is set to be true when the LE Credit based flow control is used.
-	leFrame bool
-
 	// Signaling MTUs are The maximum size of command information that the
 	// L2CAP layer entity is capable of accepting.
 	// A L2CAP implementations supporting LE-U should support at least 23 bytes.
@@ -47,23 +44,25 @@ type Conn struct {
 	sigRxMTU int
 	sigTxMTU int
 
+	sigSent chan []byte
+	// smpSent chan []byte
+
+	chInPkt chan packet
+	chInPDU chan pdu
+
+	chDone chan struct{}
+	// Host to Controller Data Flow Control pkt-based Data flow control for LE-U [Vol 2, Part E, 4.1.1]
+	// chSentBufs tracks the HCI buffer occupied by this connection.
+	txBuffer *Client
+
 	// sigID is used to match responses with signaling requests.
 	// The requesting device sets this field and the responding device uses the
 	// same value in its response. Within each signalling channel a different
 	// Identifier shall be used for each successive command. [Vol 3, Part A, 4]
 	sigID uint8
 
-	sigSent chan []byte
-	smpSent chan []byte
-
-	chInPkt chan packet
-	chInPDU chan pdu
-
-	// Host to Controller Data Flow Control pkt-based Data flow control for LE-U [Vol 2, Part E, 4.1.1]
-	// chSentBufs tracks the HCI buffer occupied by this connection.
-	txBuffer *Client
-
-	chDone chan struct{}
+	// leFrame is set to be true when the LE Credit based flow control is used.
+	leFrame bool
 }
 
 func newConn(h *HCI, param evt.LEConnectionComplete) *Conn {
@@ -94,7 +93,7 @@ func newConn(h *HCI, param evt.LEConnectionComplete) *Conn {
 				if err != io.EOF {
 					// TODO: wrap and pass the error up.
 					// err := errors.Wrap(err, "recombine failed")
-					logger.Error("recombine failed: ", "err", err)
+					_ = logger.Error("recombine failed: ", "err", err)
 				}
 				close(c.chInPDU)
 				return
@@ -140,7 +139,7 @@ func (c *Conn) Read(sdu []byte) (n int, err error) {
 	buf.Write(data)
 	for buf.Len() < slen {
 		p := <-c.chInPDU
-		buf.Write(pdu(p).payload())
+		buf.Write(p.payload())
 	}
 	return slen, nil
 }
@@ -196,6 +195,15 @@ func (c *Conn) writePDU(pdu []byte) (int, error) {
 	c.txBuffer.LockPool()
 	defer c.txBuffer.UnlockPool()
 
+	// Fail immediately if the connection is already closed
+	// Check this with the pool locked to avoid race conditions
+	// with handleDisconnectionComplete
+	select {
+	case <-c.chDone:
+		return 0, io.ErrClosedPipe
+	default:
+	}
+
 	for len(pdu) > 0 {
 		// Get a buffer from our pre-allocated and flow-controlled pool.
 		pkt := c.txBuffer.Get() // ACL pkt
@@ -205,10 +213,23 @@ func (c *Conn) writePDU(pdu []byte) (int, error) {
 		}
 
 		// Prepare the Headers
-		binary.Write(pkt, binary.LittleEndian, uint8(pktTypeACLData))                         // HCI Header: pkt Type
-		binary.Write(pkt, binary.LittleEndian, uint16(c.param.ConnectionHandle()|(flags<<8))) // ACL Header: handle and flags
-		binary.Write(pkt, binary.LittleEndian, uint16(flen))                                  // ACL Header: data len
-		binary.Write(pkt, binary.LittleEndian, pdu[:flen])                                    // Append payload
+
+		// HCI Header: pkt Type
+		if err := binary.Write(pkt, binary.LittleEndian, pktTypeACLData); err != nil {
+			return 0, err
+		}
+		// ACL Header: handle and flags
+		if err := binary.Write(pkt, binary.LittleEndian, c.param.ConnectionHandle()|(flags<<8)); err != nil {
+			return 0, err
+		}
+		// ACL Header: data len
+		if err := binary.Write(pkt, binary.LittleEndian, uint16(flen)); err != nil {
+			return 0, err
+		}
+		// Append payload
+		if err := binary.Write(pkt, binary.LittleEndian, pdu[:flen]); err != nil {
+			return 0, err
+		}
 
 		// Flush the pkt to HCI
 		select {
@@ -274,6 +295,15 @@ func (c *Conn) recombine() error {
 // Disconnected returns a receiving channel, which is closed when the connection disconnects.
 func (c *Conn) Disconnected() <-chan struct{} {
 	return c.chDone
+}
+
+// ReadRSSI retrieves the current RSSI value of remote peripheral. [Vol 2, Part E, 7.5.4]
+func (c *Conn) ReadRSSI() int {
+	rp := new(cmd.ReadRSSIRP)
+	c.hci.Send(&cmd.ReadRSSI{
+		Handle: c.param.ConnectionHandle(),
+	}, rp)
+	return int(rp.RSSI)
 }
 
 // Close disconnects the connection by sending hci disconnect command to the device.
