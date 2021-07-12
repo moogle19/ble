@@ -467,7 +467,7 @@ func (c *Client) ExecuteWrite(flags uint8) error {
 	switch {
 	case rsp[0] == ErrorResponseCode && len(rsp) == 5:
 		return ble.ATTError(rsp[4])
-	case rsp[0] == ErrorResponseCode && len(rsp) == 5:
+	case rsp[0] == ErrorResponseCode && len(rsp) != 5:
 		fallthrough
 	case rsp[0] != rsp.AttributeOpcode():
 		return ErrInvalidResponse
@@ -539,6 +539,18 @@ func (c *Client) Loop() {
 		b := make([]byte, n)
 		copy(b, c.rxBuf)
 
+		// TODO: better request identification
+		if b[0] == ExchangeMTURequestCode {
+			// Schedule this to be taken care of
+			select {
+			case ch <- asyncWork{handle: c.handleRequest, data: b}:
+			default:
+				// If this really happens, especially on a slow machine, enlarge the channel buffer.
+				_ = logger.Error("client", "req", "can't enqueue incoming request.")
+			}
+			continue
+		}
+
 		if (b[0] != HandleValueNotificationCode) && (b[0] != HandleValueIndicationCode) {
 			c.rspc <- b
 			continue
@@ -558,4 +570,63 @@ func (c *Client) Loop() {
 			_, _ = c.l2c.Write(confirmation)
 		}
 	}
+}
+
+func (c *Client) handleRequest(b []byte) {
+	switch b[0] {
+	case ExchangeMTURequestCode:
+		resp := c.handleExchangeMTURequest(b)
+		if len(resp) != 0 {
+			err := c.sendCmd(resp)
+			if err != nil {
+				_ = logger.Error("client", "req", fmt.Sprintf("error sending MTU response: %s", err.Error()))
+			}
+		}
+	default:
+		errRsp := newErrorResponse(b[0], 0x0000, ble.ErrReqNotSupp)
+		_ = c.sendCmd(errRsp)
+		_ = logger.Warn("client", "req", fmt.Sprintf("Received unhandled request [0x%X]", b))
+	}
+}
+
+// handle MTU Exchange request. [Vol 3, Part F, 3.4.2]
+// ExchangeMTU informs the server of the client’s maximum receive MTU size and
+// request the server to respond with its maximum receive MTU size. [Vol 3, Part F, 3.4.2.1]
+func (c *Client) handleExchangeMTURequest(r ExchangeMTURequest) []byte {
+	// Acquire and reuse the txBuf, and release it after usage.
+	// The same txBuf, or a newly allocate one, if the txMTU is changed,
+	// will be released back to the channel.
+
+	// We do this first to prevent races with ExchangeMTURequest
+	txBuf := <-c.chTxBuf
+
+	// Validate the request.
+	switch {
+	case len(r) != 3:
+		fallthrough
+	case r.ClientRxMTU() < 23:
+		return newErrorResponse(r.AttributeOpcode(), 0x0000, ble.ErrInvalidPDU)
+	}
+
+	txMTU := int(r.ClientRxMTU())
+	// Our rxMTU for the response
+	rxMTU := c.l2c.RxMTU()
+
+	// Update transmit MTU to max supported by the other side
+	logger.Debug("client", "req", fmt.Sprintf("server requested an MTU change to TX:%d RX:%d", txMTU, rxMTU))
+	c.l2c.SetTxMTU(txMTU)
+
+	defer func() {
+		// Update the tx buffer if needed
+		if len(txBuf) != txMTU {
+			c.chTxBuf <- make([]byte, txMTU, txMTU)
+		} else {
+			c.chTxBuf <- txBuf
+		}
+	}()
+
+	rsp := ExchangeMTUResponse(txBuf)
+	rsp.SetAttributeOpcode()
+	rsp.SetServerRxMTU(uint16(rxMTU))
+	return rsp[:3]
 }

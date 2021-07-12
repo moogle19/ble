@@ -297,6 +297,15 @@ func (c *Conn) Disconnected() <-chan struct{} {
 	return c.chDone
 }
 
+// ReadRSSI retrieves the current RSSI value of remote peripheral. [Vol 2, Part E, 7.5.4]
+func (c *Conn) ReadRSSI() int {
+	rp := new(cmd.ReadRSSIRP)
+	c.hci.Send(&cmd.ReadRSSI{
+		Handle: c.param.ConnectionHandle(),
+	}, rp)
+	return int(rp.RSSI)
+}
+
 // Close disconnects the connection by sending hci disconnect command to the device.
 func (c *Conn) Close() error {
 	select {

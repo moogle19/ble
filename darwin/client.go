@@ -4,24 +4,40 @@ import (
 	"fmt"
 
 	"github.com/go-ble/ble"
-	"github.com/raff/goble/xpc"
+	"github.com/JuulLabs-OSS/cbgo"
 )
 
 // A Client is a GATT client.
 type Client struct {
-	profile *ble.Profile
-	name    string
+	cbgo.PeripheralDelegateBase
 
-	id   xpc.UUID
+	profile *ble.Profile
+	pc      profCache
+	name    string
+	cm      cbgo.CentralManager
+
+	id   ble.UUID
 	conn *conn
 }
 
 // NewClient ...
-func NewClient(c ble.Conn) (*Client, error) {
-	return &Client{
+func NewClient(cm cbgo.CentralManager, c ble.Conn) (*Client, error) {
+	as := c.RemoteAddr().String()
+	id, err := ble.Parse(as)
+	if err != nil {
+		return nil, fmt.Errorf("connection has invalid address: addr=%s", as)
+	}
+
+	cln := &Client{
 		conn: c.(*conn),
-		id:   xpc.MakeUUID(c.RemoteAddr().String()),
-	}, nil
+		pc:   newProfCache(),
+		cm:   cm,
+		id:   id,
+	}
+
+	cln.conn.prph.SetDelegate(cln)
+
+	return cln, nil
 }
 
 // Addr returns UUID of the remote peripheral.
@@ -68,24 +84,29 @@ func (cln *Client) DiscoverProfile(force bool) (*ble.Profile, error) {
 // DiscoverServices finds all the primary services on a server. [Vol 3, Part G, 4.4.1]
 // If filter is specified, only filtered services are returned.
 func (cln *Client) DiscoverServices(ss []ble.UUID) ([]*ble.Service, error) {
-	rsp, err := cln.conn.sendReq(cmdDiscoverServices, xpc.Dict{
-		"kCBMsgArgDeviceUUID": cln.id,
-		"kCBMsgArgUUIDs":      uuidSlice(ss),
-	})
-	if err != nil {
-		return nil, err
+	ch := cln.conn.evl.svcsDiscovered.Listen()
+	defer cln.conn.evl.svcsDiscovered.Close()
+
+	cbuuids := uuidsToCbgoUUIDs(ss)
+	cln.conn.prph.DiscoverServices(cbuuids)
+
+	select {
+	case itf := <-ch:
+		if itf != nil {
+			return nil, itf.(error)
+		}
+
+	case <-cln.Disconnected():
+		return nil, fmt.Errorf("disconnected")
 	}
-	if err := rsp.err(); err != nil {
-		return nil, err
-	}
+
 	svcs := []*ble.Service{}
-	for _, xss := range rsp.services() {
-		xs := msg(xss.(xpc.Dict))
-		svcs = append(svcs, &ble.Service{
-			UUID:      ble.MustParse(xs.uuid()),
-			Handle:    uint16(xs.serviceStartHandle()),
-			EndHandle: uint16(xs.serviceEndHandle()),
-		})
+	for _, dsvc := range cln.conn.prph.Services() {
+		svc := &ble.Service{
+			UUID: ble.UUID(dsvc.UUID()),
+		}
+		cln.pc.addSvc(svc, dsvc)
+		svcs = append(svcs, svc)
 	}
 	if cln.profile == nil {
 		cln.profile = &ble.Profile{Services: svcs}
@@ -96,44 +117,40 @@ func (cln *Client) DiscoverServices(ss []ble.UUID) ([]*ble.Service, error) {
 // DiscoverIncludedServices finds the included services of a service. [Vol 3, Part G, 4.5.1]
 // If filter is specified, only filtered services are returned.
 func (cln *Client) DiscoverIncludedServices(ss []ble.UUID, s *ble.Service) ([]*ble.Service, error) {
-	rsp, err := cln.conn.sendReq(cmdDiscoverIncludedServices, xpc.Dict{
-		"kCBMsgArgDeviceUUID":         cln.id,
-		"kCBMsgArgServiceStartHandle": s.Handle,
-		"kCBMsgArgServiceEndHandle":   s.EndHandle,
-		"kCBMsgArgUUIDs":              uuidSlice(ss),
-	})
-	if err != nil {
-		return nil, err
-	}
-	if err := rsp.err(); err != nil {
-		return nil, err
-	}
 	return nil, ble.ErrNotImplemented
 }
 
 // DiscoverCharacteristics finds all the characteristics within a service. [Vol 3, Part G, 4.6.1]
 // If filter is specified, only filtered characteristics are returned.
 func (cln *Client) DiscoverCharacteristics(cs []ble.UUID, s *ble.Service) ([]*ble.Characteristic, error) {
-	rsp, err := cln.conn.sendReq(cmdDiscoverCharacteristics, xpc.Dict{
-		"kCBMsgArgDeviceUUID":         cln.id,
-		"kCBMsgArgServiceStartHandle": s.Handle,
-		"kCBMsgArgServiceEndHandle":   s.EndHandle,
-		"kCBMsgArgUUIDs":              uuidSlice(cs),
-	})
+	cbsvc, err := cln.pc.findCbSvc(s)
 	if err != nil {
 		return nil, err
 	}
-	if err := rsp.err(); err != nil {
-		return nil, err
+
+	ch := cln.conn.evl.chrsDiscovered.Listen()
+	defer cln.conn.evl.chrsDiscovered.Close()
+
+	cbuuids := uuidsToCbgoUUIDs(cs)
+	cln.conn.prph.DiscoverCharacteristics(cbuuids, cbsvc)
+
+	select {
+	case itf := <-ch:
+		if itf != nil {
+			return nil, itf.(error)
+		}
+
+	case <-cln.Disconnected():
+		return nil, fmt.Errorf("disconnected")
 	}
-	for _, xcs := range rsp.characteristics() {
-		xc := msg(xcs.(xpc.Dict))
-		s.Characteristics = append(s.Characteristics, &ble.Characteristic{
-			UUID:        ble.MustParse(xc.uuid()),
-			Property:    ble.Property(xc.characteristicProperties()),
-			Handle:      uint16(xc.characteristicHandle()),
-			ValueHandle: uint16(xc.characteristicValueHandle()),
-		})
+
+	for _, dchr := range cbsvc.Characteristics() {
+		chr := &ble.Characteristic{
+			UUID:     ble.UUID(dchr.UUID()),
+			Property: ble.Property(dchr.Properties()),
+		}
+		cln.pc.addChr(chr, dchr)
+		s.Characteristics = append(s.Characteristics, chr)
 	}
 	return s.Characteristics, nil
 }
@@ -141,108 +158,177 @@ func (cln *Client) DiscoverCharacteristics(cs []ble.UUID, s *ble.Service) ([]*bl
 // DiscoverDescriptors finds all the descriptors within a characteristic. [Vol 3, Part G, 4.7.1]
 // If filter is specified, only filtered descriptors are returned.
 func (cln *Client) DiscoverDescriptors(ds []ble.UUID, c *ble.Characteristic) ([]*ble.Descriptor, error) {
-	rsp, err := cln.conn.sendReq(cmdDiscoverDescriptors, xpc.Dict{
-		"kCBMsgArgDeviceUUID":                cln.id,
-		"kCBMsgArgCharacteristicHandle":      c.Handle,
-		"kCBMsgArgCharacteristicValueHandle": c.ValueHandle,
-		"kCBMsgArgUUIDs":                     uuidSlice(ds),
-	})
+	cbchr, err := cln.pc.findCbChr(c)
 	if err != nil {
 		return nil, err
 	}
-	if err := rsp.err(); err != nil {
+
+	ch := cln.conn.evl.dscsDiscovered.Listen()
+	defer cln.conn.evl.dscsDiscovered.Close()
+
+	cln.conn.prph.DiscoverDescriptors(cbchr)
+	if err != nil {
 		return nil, err
 	}
-	for _, xds := range rsp.descriptors() {
-		xd := msg(xds.(xpc.Dict))
-		c.Descriptors = append(c.Descriptors, &ble.Descriptor{
-			UUID:   ble.MustParse(xd.uuid()),
-			Handle: uint16(xd.descriptorHandle()),
-		})
+
+	select {
+	case itf := <-ch:
+		if itf != nil {
+			return nil, itf.(error)
+		}
+
+	case <-cln.Disconnected():
+		return nil, fmt.Errorf("disconnected")
+	}
+
+	for _, ddsc := range cbchr.Descriptors() {
+		dsc := &ble.Descriptor{
+			UUID: ble.UUID(ddsc.UUID()),
+		}
+		c.Descriptors = append(c.Descriptors, dsc)
+		cln.pc.addDsc(dsc, ddsc)
 	}
 	return c.Descriptors, nil
 }
 
 // ReadCharacteristic reads a characteristic value from a server. [Vol 3, Part G, 4.8.1]
 func (cln *Client) ReadCharacteristic(c *ble.Characteristic) ([]byte, error) {
-	rsp, err := cln.conn.sendReq(cmdReadCharacteristic, xpc.Dict{
-		"kCBMsgArgDeviceUUID":                cln.id,
-		"kCBMsgArgCharacteristicHandle":      c.Handle,
-		"kCBMsgArgCharacteristicValueHandle": c.ValueHandle,
-	})
+	cbchr, err := cln.pc.findCbChr(c)
 	if err != nil {
 		return nil, err
 	}
-	if rsp.err() != nil {
-		return nil, rsp.err()
+
+	ch, err := cln.conn.addChrReader(c)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read characteristic: %v", err)
 	}
-	c.Value = rsp.data()
-	return rsp.data(), nil
+	defer cln.conn.delChrReader(c)
+
+	cln.conn.prph.ReadCharacteristic(cbchr)
+
+	select {
+	case itf := <-ch:
+		if itf != nil {
+			return nil, itf.(error)
+		}
+
+	case <-cln.Disconnected():
+		return nil, fmt.Errorf("disconnected")
+	}
+
+	c.Value = cbchr.Value()
+
+	return c.Value, nil
 }
 
 // ReadLongCharacteristic reads a characteristic value which is longer than the MTU. [Vol 3, Part G, 4.8.3]
 func (cln *Client) ReadLongCharacteristic(c *ble.Characteristic) ([]byte, error) {
-	return nil, ble.ErrNotImplemented
+	return cln.ReadCharacteristic(c)
 }
 
 // WriteCharacteristic writes a characteristic value to a server. [Vol 3, Part G, 4.9.3]
 func (cln *Client) WriteCharacteristic(c *ble.Characteristic, b []byte, noRsp bool) error {
-	args := xpc.Dict{
-		"kCBMsgArgDeviceUUID":                cln.id,
-		"kCBMsgArgCharacteristicHandle":      c.Handle,
-		"kCBMsgArgCharacteristicValueHandle": c.ValueHandle,
-		"kCBMsgArgData":                      b,
-		"kCBMsgArgType":                      map[bool]int{false: 0, true: 1}[noRsp],
-	}
-	if noRsp {
-		return cln.conn.sendCmd(cmdWriteCharacteristic, args)
-	}
-	m, err := cln.conn.sendReq(cmdWriteCharacteristic, args)
+	cbchr, err := cln.pc.findCbChr(c)
 	if err != nil {
 		return err
 	}
-	return m.err()
+
+	if noRsp {
+		cln.conn.prph.WriteCharacteristic(b, cbchr, false)
+		return nil
+	}
+
+	ch := cln.conn.evl.chrWritten.Listen()
+	defer cln.conn.evl.chrWritten.Close()
+
+	cln.conn.prph.WriteCharacteristic(b, cbchr, true)
+
+	select {
+	case itf := <-ch:
+		if itf != nil {
+			return itf.(error)
+		}
+
+	case <-cln.Disconnected():
+		return fmt.Errorf("disconnected")
+	}
+
+	return nil
 }
 
 // ReadDescriptor reads a characteristic descriptor from a server. [Vol 3, Part G, 4.12.1]
 func (cln *Client) ReadDescriptor(d *ble.Descriptor) ([]byte, error) {
-	rsp, err := cln.conn.sendReq(cmdReadDescriptor, xpc.Dict{
-		"kCBMsgArgDeviceUUID":       cln.id,
-		"kCBMsgArgDescriptorHandle": d.Handle,
-	})
+	cbdsc, err := cln.pc.findCbDsc(d)
 	if err != nil {
 		return nil, err
 	}
-	if err := rsp.err(); err != nil {
-		return nil, err
+
+	ch := cln.conn.evl.dscRead.Listen()
+	defer cln.conn.evl.dscRead.Close()
+
+	cln.conn.prph.ReadDescriptor(cbdsc)
+
+	select {
+	case itf := <-ch:
+		if itf != nil {
+			return nil, itf.(error)
+		}
+
+	case <-cln.Disconnected():
+		return nil, fmt.Errorf("disconnected")
 	}
-	d.Value = rsp.data()
-	return rsp.data(), nil
+
+	d.Value = cbdsc.Value()
+
+	return d.Value, nil
 }
 
 // WriteDescriptor writes a characteristic descriptor to a server. [Vol 3, Part G, 4.12.3]
 func (cln *Client) WriteDescriptor(d *ble.Descriptor, b []byte) error {
-	rsp, err := cln.conn.sendReq(cmdWriteDescriptor, xpc.Dict{
-		"kCBMsgArgDeviceUUID":       cln.id,
-		"kCBMsgArgDescriptorHandle": d.Handle,
-		"kCBMsgArgData":             b,
-	})
+	cbdsc, err := cln.pc.findCbDsc(d)
 	if err != nil {
 		return err
 	}
-	return rsp.err()
+
+	ch := cln.conn.evl.dscWritten.Listen()
+	defer cln.conn.evl.dscWritten.Close()
+
+	cln.conn.prph.WriteDescriptor(b, cbdsc)
+	if err != nil {
+		return err
+	}
+
+	select {
+	case itf := <-ch:
+		if itf != nil {
+			return itf.(error)
+		}
+
+	case <-cln.Disconnected():
+		return fmt.Errorf("disconnected")
+	}
+
+	return nil
 }
 
 // ReadRSSI retrieves the current RSSI value of remote peripheral. [Vol 2, Part E, 7.5.4]
 func (cln *Client) ReadRSSI() int {
-	rsp, err := cln.conn.sendReq(cmdReadRSSI, xpc.Dict{"kCBMsgArgDeviceUUID": cln.id})
-	if err != nil {
+	ch := cln.conn.evl.rssiRead.Listen()
+	defer cln.conn.evl.rssiRead.Close()
+
+	cln.conn.prph.ReadRSSI()
+
+	select {
+	case itf := <-ch:
+		ev := itf.(*eventRSSIRead)
+		if ev.err != nil {
+			return 0
+		}
+		return ev.rssi
+
+	case <-cln.Disconnected():
 		return 0
 	}
-	if rsp.err() != nil {
-		return 0
-	}
-	return rsp.rssi()
 }
 
 // ExchangeMTU set the ATT_MTU to the maximum possible value that can be
@@ -255,44 +341,58 @@ func (cln *Client) ExchangeMTU(mtu int) (int, error) {
 // Subscribe subscribes to indication (if ind is set true), or notification of a
 // characteristic value. [Vol 3, Part G, 4.10 & 4.11]
 func (cln *Client) Subscribe(c *ble.Characteristic, ind bool, fn ble.NotificationHandler) error {
-	cln.conn.Lock()
-	defer cln.conn.Unlock()
-	cln.conn.subs[c.Handle] = &sub{fn: fn, char: c}
-	rsp, err := cln.conn.sendReq(cmdSubscribeCharacteristic, xpc.Dict{
-		"kCBMsgArgDeviceUUID":                cln.id,
-		"kCBMsgArgCharacteristicHandle":      c.Handle,
-		"kCBMsgArgCharacteristicValueHandle": c.ValueHandle,
-		"kCBMsgArgState":                     1,
-	})
+	cbchr, err := cln.pc.findCbChr(c)
 	if err != nil {
-		delete(cln.conn.subs, c.Handle)
 		return err
 	}
-	if err := rsp.err(); err != nil {
-		delete(cln.conn.subs, c.Handle)
-		return err
+
+	cln.conn.addSub(c, fn)
+
+	ch := cln.conn.evl.notifyChanged.Listen()
+	defer cln.conn.evl.notifyChanged.Close()
+
+	cln.conn.prph.SetNotify(true, cbchr)
+
+	select {
+	case itf := <-ch:
+		if itf != nil {
+			cln.conn.delSub(c)
+			return itf.(error)
+		}
+
+	case <-cln.Disconnected():
+		cln.conn.delSub(c)
+		return fmt.Errorf("disconnected")
 	}
+
 	return nil
 }
 
 // Unsubscribe unsubscribes to indication (if ind is set true), or notification
 // of a specified characteristic value. [Vol 3, Part G, 4.10 & 4.11]
 func (cln *Client) Unsubscribe(c *ble.Characteristic, ind bool) error {
-	rsp, err := cln.conn.sendReq(cmdSubscribeCharacteristic, xpc.Dict{
-		"kCBMsgArgDeviceUUID":                cln.id,
-		"kCBMsgArgCharacteristicHandle":      c.Handle,
-		"kCBMsgArgCharacteristicValueHandle": c.ValueHandle,
-		"kCBMsgArgState":                     0,
-	})
+	cbchr, err := cln.pc.findCbChr(c)
 	if err != nil {
 		return err
 	}
-	if err := rsp.err(); err != nil {
-		return err
+
+	ch := cln.conn.evl.notifyChanged.Listen()
+	defer cln.conn.evl.notifyChanged.Close()
+
+	cln.conn.prph.SetNotify(false, cbchr)
+
+	select {
+	case itf := <-ch:
+		if itf != nil {
+			return itf.(error)
+		}
+
+	case <-cln.Disconnected():
+		return fmt.Errorf("disconnected")
 	}
-	cln.conn.Lock()
-	defer cln.conn.Unlock()
-	delete(cln.conn.subs, c.Handle)
+
+	cln.conn.delSub(c)
+
 	return nil
 }
 
@@ -308,11 +408,8 @@ func (cln *Client) ClearSubscriptions() error {
 
 // CancelConnection disconnects the connection.
 func (cln *Client) CancelConnection() error {
-	rsp, err := cln.conn.sendReq(cmdDisconnect, xpc.Dict{"kCBMsgArgDeviceUUID": cln.id})
-	if err != nil {
-		return err
-	}
-	return rsp.err()
+	cln.cm.CancelConnect(cln.conn.prph)
+	return nil
 }
 
 // Disconnected returns a receiving channel, which is closed when the client disconnects.
@@ -328,4 +425,36 @@ func (cln *Client) Conn() ble.Conn {
 type sub struct {
 	fn   ble.NotificationHandler
 	char *ble.Characteristic
+}
+
+func (cln *Client) DidDiscoverServices(prph cbgo.Peripheral, err error) {
+	cln.conn.evl.svcsDiscovered.RxSignal(err)
+}
+func (cln *Client) DidDiscoverCharacteristics(prph cbgo.Peripheral, svc cbgo.Service, err error) {
+	cln.conn.evl.chrsDiscovered.RxSignal(err)
+}
+func (cln *Client) DidDiscoverDescriptors(prph cbgo.Peripheral, chr cbgo.Characteristic, err error) {
+	cln.conn.evl.dscsDiscovered.RxSignal(err)
+}
+func (cln *Client) DidUpdateValueForCharacteristic(prph cbgo.Peripheral, chr cbgo.Characteristic, err error) {
+	cln.conn.processChrRead(err, chr)
+}
+
+func (cln *Client) DidUpdateValueForDescriptor(prph cbgo.Peripheral, dsc cbgo.Descriptor, err error) {
+	cln.conn.evl.dscRead.RxSignal(err)
+}
+func (cln *Client) DidWriteValueForCharacteristic(prph cbgo.Peripheral, chr cbgo.Characteristic, err error) {
+	cln.conn.evl.chrWritten.RxSignal(err)
+}
+func (cln *Client) DidWriteValueForDescriptor(prph cbgo.Peripheral, dsc cbgo.Descriptor, err error) {
+	cln.conn.evl.dscWritten.RxSignal(err)
+}
+func (cln *Client) DidUpdateNotificationState(prph cbgo.Peripheral, chr cbgo.Characteristic, err error) {
+	cln.conn.evl.notifyChanged.RxSignal(err)
+}
+func (cln *Client) DidReadRSSI(prph cbgo.Peripheral, rssi int, err error) {
+	cln.conn.evl.rssiRead.RxSignal(&eventRSSIRead{
+		err:  err,
+		rssi: int(rssi),
+	})
 }

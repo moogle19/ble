@@ -296,8 +296,7 @@ func (p *Client) WriteDescriptor(d *ble.Descriptor, v []byte) error {
 func (p *Client) ReadRSSI() int {
 	p.Lock()
 	defer p.Unlock()
-	// TODO:
-	return 0
+	return p.conn.ReadRSSI()
 }
 
 // ExchangeMTU informs the server of the client’s maximum receive MTU size and

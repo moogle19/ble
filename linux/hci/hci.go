@@ -473,6 +473,10 @@ func (h *HCI) handleCommandStatus(b []byte) error {
 
 func (h *HCI) handleLEConnectionComplete(b []byte) error {
 	e := evt.LEConnectionComplete(b)
+	if e.Role() == roleMaster && ErrCommand(e.Status()) == ErrConnID {
+		// The connection was canceled successfully.
+		return nil
+	}
 	c := newConn(h, e)
 	h.muConns.Lock()
 	h.conns[e.ConnectionHandle()] = c
@@ -484,10 +488,6 @@ func (h *HCI) handleLEConnectionComplete(b []byte) error {
 			default:
 				go c.Close()
 			}
-			return nil
-		}
-		if ErrCommand(e.Status()) == ErrConnID {
-			// The connection was canceled successfully.
 			return nil
 		}
 		return nil
@@ -505,7 +505,7 @@ func (h *HCI) handleLEConnectionComplete(b []byte) error {
 		// So we also re-enable the advertising when a connection disconnected
 		h.params.RLock()
 		if h.params.advEnable.AdvertisingEnable == 1 {
-			go h.Send(&cmd.LESetAdvertiseEnable{0}, nil)
+			go h.Send(&cmd.LESetAdvertiseEnable{AdvertisingEnable: 0}, nil)
 		}
 		h.params.RUnlock()
 	}

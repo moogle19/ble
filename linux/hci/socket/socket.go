@@ -13,11 +13,11 @@ import (
 )
 
 func ioR(t, nr, size uintptr) uintptr {
-	return (2 << 30) | (t << 8) | nr | (size << 16)
+	return (directionRead << directionShift) | (t << typeShift) | nr | (size << sizeShift)
 }
 
 func ioW(t, nr, size uintptr) uintptr {
-	return (1 << 30) | (t << 8) | nr | (size << 16)
+	return (directionWrite << directionShift) | (t << typeShift) | nr | (size << sizeShift)
 }
 
 func ioctl(fd, op, arg uintptr) error {
